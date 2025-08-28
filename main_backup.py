@@ -1,3 +1,4 @@
+import os
 import shutil
 import datetime
 import sys
@@ -13,10 +14,7 @@ for path in qt_plugin_paths:
     if os.path.exists(path):
         os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = path
         break
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QTableWidget, QTableWidgetItem, QFileDialog, QLabel, QDateEdit, QCheckBox,
-    QMessageBox, QDialog, QComboBox, QColorDialog
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, QTableWidgetItem, QFileDialog, QLabel, QDateEdit, QCheckBox, QMessageBox, QDialog, QComboBox, QColorDialog, QTableWidgetSelectionMode
 )
 from PyQt5 import QtGui
 from PyQt5.QtCore import Qt, QDate
@@ -99,12 +97,68 @@ class MainWindow(QMainWindow):
         self.invoice_table.setHorizontalHeaderLabels(["发票编号", "金额", "税额", "日期", "发票类型", "分类", "状态", "截止日期", "行程单", "操作"])
         self.invoice_table.horizontalHeader().setStretchLastSection(True)
         # 设置选择模式为多选
-        self.invoice_table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self.invoice_table.setSelectionMode(QTableWidgetSelectionMode.ExtendedSelection)
         main_layout.addWidget(self.invoice_table)
 
         # 加载发票数据
         self.load_invoices()
     
+    def bulk_delete_invoices(self):
+        """批量删除选中的发票及其关联的行程记录"""
+        # 获取选中的行
+        selected_rows = set(index.row() for index in self.invoice_table.selectedIndexes())
+        if not selected_rows:
+            QMessageBox.warning(self, "警告", "请先选择要删除的发票！")
+            return
+
+        # 确认删除
+        reply = QMessageBox.question(self, '确认删除', f'确定要删除选中的 {len(selected_rows)} 个发票吗？',
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+
+        if reply == QMessageBox.Yes:
+            from models.database import get_db, Invoice, Itinerary
+            import os
+
+            db = next(get_db())
+            invoices = db.query(Invoice).all()
+            deleted_count = 0
+            failed_count = 0
+            failed_invoices = []
+
+            try:
+                for row in selected_rows:
+                    invoice_number = self.invoice_table.item(row, 0).text()
+                    # 查找对应的发票
+                    for invoice in invoices:
+                        if invoice.invoice_number == invoice_number:
+                            try:
+                                # 删除关联的行程记录
+                                itineraries = db.query(Itinerary).filter(Itinerary.invoice_id == invoice.id).all()
+                                for itinerary in itineraries:
+                                    db.delete(itinerary)
+
+                                # 删除对应的PDF文件
+                                if invoice.pdf_path and os.path.exists(invoice.pdf_path):
+                                    os.remove(invoice.pdf_path)
+
+                                # 从数据库中删除发票记录
+                                db.delete(invoice)
+                                deleted_count += 1
+                            except Exception as e:
+                                failed_count += 1
+                                failed_invoices.append(f"{invoice_number}: {str(e)}")
+                            break
+
+                db.commit()
+                message = f"成功删除 {deleted_count} 个发票及其关联的行程记录！"
+                if failed_count > 0:
+                    message += f"\n\n有 {failed_count} 个发票删除失败:\n" + "\n".join(failed_invoices)
+                QMessageBox.information(self, "成功", message)
+                self.load_invoices()
+            except Exception as e:
+                db.rollback()
+                QMessageBox.critical(self, "错误", f"批量删除失败: {str(e)}")
+
     def select_category(self, default_category=None):
         """打开分类选择对话框并返回选择的分类和自动匹配的颜色"""
         from PyQt5.QtGui import QColor
@@ -211,7 +265,7 @@ class MainWindow(QMainWindow):
                         parsed_info = ocr.parse_invoice_info(text)
 
                         # 重命名文件（默认为未报销状态）
-                        new_file_path = self._rename_invoice_file(file_path, parsed_info, is_reimbursed=False, category=category)
+                        new_file_path = self._rename_invoice_file(file_path, parsed_info, is_reimbursed=False)
 
                         # 创建发票记录
                         new_invoice = Invoice(
@@ -261,7 +315,7 @@ class MainWindow(QMainWindow):
                 self.load_invoices()
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"批量导入失败: {str(e)}")
-    
+
     def _compare_file_contents(self, file1_path, file2_path):
         """比较两个文件的内容是否相同"""
         try:
@@ -272,7 +326,7 @@ class MainWindow(QMainWindow):
             print(f"比较文件内容失败: {str(e)}")
             return False
     
-    def _rename_invoice_file(self, file_path, parsed_info, is_reimbursed=False, category=None, target_dir=None):
+    def _rename_invoice_file(self, file_path, parsed_info, is_reimbursed=False):
         """根据发票信息和报销状态重命名文件并保存到对应文件夹"""
         import os
 
@@ -284,11 +338,7 @@ class MainWindow(QMainWindow):
         os.makedirs(not_reimbursed_dir, exist_ok=True)
 
         # 确定目标文件夹
-        if target_dir:
-            # 使用指定的目标文件夹
-            os.makedirs(target_dir, exist_ok=True)
-        else:
-            target_dir = reimbursed_dir if is_reimbursed else not_reimbursed_dir
+        target_dir = reimbursed_dir if is_reimbursed else not_reimbursed_dir
 
         # 生成新文件名
         invoice_type = parsed_info.get('type', '其他票据')
@@ -303,7 +353,7 @@ class MainWindow(QMainWindow):
         if invoice_date:
             date_str = invoice_date.strftime('%Y%m%d')
         else:
-            date_str = datetime.datetime.now().strftime('%Y%m%d')
+            date_str = datetime.now().strftime('%Y%m%d')
 
         # 确定分类：优先使用用户提供的分类，否则自动确定
         if category:
@@ -325,7 +375,7 @@ class MainWindow(QMainWindow):
             if self._compare_file_contents(file_path, new_file_path):
                 return new_file_path
             # 内容不同时添加时间戳
-            timestamp = datetime.datetime.now().strftime('%H%M%S')
+            timestamp = datetime.now().strftime('%H%M%S')
             new_file_name = f"{date_str}_{category_to_use}_{invoice_type}_{amount_str}_{invoice_number}_{timestamp}{file_ext}"
             new_file_path = os.path.join(target_dir, new_file_name)
 
@@ -333,414 +383,7 @@ class MainWindow(QMainWindow):
         shutil.copy2(file_path, new_file_path)
 
         return new_file_path
-    
-    def load_invoices(self):
-        """加载发票列表"""
-        from models.database import get_db, Invoice
 
-        self.invoice_table.setRowCount(0)
-        db = next(get_db())
-        invoices = db.query(Invoice).all()
-
-        for row, invoice in enumerate(invoices):
-            self.invoice_table.insertRow(row)
-            self.invoice_table.setItem(row, 0, QTableWidgetItem(invoice.invoice_number or "未知"))
-            # 显示含税金额
-            total_amount = invoice.amount + invoice.tax_amount if (invoice.amount and invoice.tax_amount) else invoice.amount
-            self.invoice_table.setItem(row, 1, QTableWidgetItem(str(total_amount) if total_amount else "未知"))
-            self.invoice_table.setItem(row, 2, QTableWidgetItem(str(invoice.tax_amount) if invoice.tax_amount else "未知"))
-            self.invoice_table.setItem(row, 3, QTableWidgetItem(invoice.invoice_date.strftime('%Y-%m-%d') if invoice.invoice_date else "未知"))
-            self.invoice_table.setItem(row, 4, QTableWidgetItem(invoice.invoice_type or "未知类型"))
-            # 分类显示（带颜色）
-            category_item = QTableWidgetItem(invoice.category or "未分类")
-            if invoice.category_color:
-                category_item.setBackground(QtGui.QColor(invoice.category_color))
-            self.invoice_table.setItem(row, 5, category_item)
-
-            self.invoice_table.setItem(row, 6, QTableWidgetItem("已报销" if invoice.is_reimbursed else "未报销"))
-            self.invoice_table.setItem(row, 7, QTableWidgetItem(invoice.due_date.strftime('%Y-%m-%d') if invoice.due_date else "未设置"))
-
-            # 行程单状态
-            has_itinerary = "有" if "--- 行程单信息 ---" in invoice.recognized_text else "无"
-            self.invoice_table.setItem(row, 8, QTableWidgetItem(has_itinerary))
-
-            # 操作按钮
-            btn_layout = QHBoxLayout()
-            status_btn = QPushButton("标记报销")
-            status_btn.clicked.connect(lambda checked, id=invoice.id: self.toggle_reimbursement(id))
-            btn_layout.addWidget(status_btn)
-
-            reminder_btn = QPushButton("设置提醒")
-            reminder_btn.clicked.connect(lambda checked, id=invoice.id: self.set_reminder(id))
-            btn_layout.addWidget(reminder_btn)
-
-            category_btn = QPushButton("分类")
-            category_btn.clicked.connect(lambda checked, id=invoice.id: self.set_category(id))
-            btn_layout.addWidget(category_btn)
-
-            delete_btn = QPushButton("删除")
-            delete_btn.clicked.connect(lambda checked, id=invoice.id: self.delete_invoice(id))
-            btn_layout.addWidget(delete_btn)
-
-            btn_widget = QWidget()
-            btn_widget.setLayout(btn_layout)
-            self.invoice_table.setCellWidget(row, 9, btn_widget)
-    
-    def toggle_reimbursement(self, invoice_id):
-        """切换发票报销状态并移动文件到对应文件夹"""
-        from models.database import get_db, Invoice
-        from datetime import datetime
-        import os
-        import shutil
-
-        db = next(get_db())
-        invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
-        if invoice:
-            old_is_reimbursed = invoice.is_reimbursed
-            invoice.is_reimbursed = not invoice.is_reimbursed
-            if invoice.is_reimbursed:
-                invoice.reimbursement_date = datetime.now().date()
-            else:
-                invoice.reimbursement_date = None
-
-            # 移动文件到对应文件夹
-            if invoice.pdf_path and os.path.exists(invoice.pdf_path):
-                # 解析发票信息以生成新路径
-                from services.ocr_processor import OCRProcessor
-                ocr = OCRProcessor()
-                text = ocr.extract_text_from_pdf(invoice.pdf_path)
-                parsed_info = ocr.parse_invoice_info(text)
-
-                # 生成新路径
-                new_file_path = self._rename_invoice_file(
-                    invoice.pdf_path, parsed_info, invoice.is_reimbursed, invoice.category
-                )
-
-                # 更新数据库中的文件路径
-                invoice.pdf_path = new_file_path
-
-            db.commit()
-            self.load_invoices()
-    
-    def set_category(self, invoice_id):
-        """设置发票分类"""
-        from models.database import get_db, Invoice
-        from PyQt5.QtGui import QColor
-
-        db = next(get_db())
-        invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
-        if not invoice:
-            return
-
-        # 创建分类对话框
-        dialog = QDialog(self)
-        dialog.setWindowTitle("设置分类")
-        layout = QVBoxLayout(dialog)
-
-        # 分类选择
-        layout.addWidget(QLabel("选择分类:"))
-        category_combo = QComboBox()
-        categories = ["餐饮", "交通", "办公", "差旅", "娱乐", "其他"]
-        category_combo.addItems(categories)
-        category_combo.setEditable(True)
-        if invoice.category:
-            category_combo.setCurrentText(invoice.category)
-        layout.addWidget(category_combo)
-
-        # 颜色选择
-        color_layout = QHBoxLayout()
-        color_label = QLabel("分类颜色:")
-        color_btn = QPushButton("选择颜色")
-        current_color = QColor(invoice.category_color) if invoice.category_color else QColor("#FFFFFF")
-        color_preview = QLabel()
-        color_preview.setFixedSize(30, 30)
-        color_preview.setStyleSheet(f"background-color: {current_color.name()}")
-
-        def choose_color():
-            nonlocal current_color
-            color = QColorDialog.getColor(current_color, self, "选择分类颜色")
-            if color.isValid():
-                current_color = color
-                color_preview.setStyleSheet(f"background-color: {current_color.name()}")
-
-        color_btn.clicked.connect(choose_color)
-        color_layout.addWidget(color_label)
-        color_layout.addWidget(color_btn)
-        color_layout.addWidget(color_preview)
-        layout.addLayout(color_layout)
-
-        # 确认按钮
-        btn_layout = QHBoxLayout()
-        ok_btn = QPushButton("确定")
-        cancel_btn = QPushButton("取消")
-
-        def on_ok():
-            invoice.category = category_combo.currentText()
-            invoice.category_color = current_color.name() if current_color.isValid() else None
-            db.commit()
-            self.load_invoices()
-            dialog.accept()
-
-        ok_btn.clicked.connect(on_ok)
-        cancel_btn.clicked.connect(dialog.reject)
-        btn_layout.addWidget(ok_btn)
-        btn_layout.addWidget(cancel_btn)
-        layout.addLayout(btn_layout)
-
-        dialog.exec_()
-    
-    def backup_database(self):
-        """备份数据库"""
-        from models.database import DB_PATH
-        if not os.path.exists(DB_PATH):
-            QMessageBox.warning(self, "警告", "数据库文件不存在！")
-            return
-
-        # 生成默认备份文件名
-        default_filename = f"invoice_backup_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-        save_path, _ = QFileDialog.getSaveFileName(
-            self, "保存备份", default_filename, "Database Files (*.db);;All Files (*)"
-        )
-
-        if save_path:
-            try:
-                shutil.copy2(DB_PATH, save_path)
-                QMessageBox.information(self, "成功", f"数据库备份成功！\n保存路径：{save_path}")
-            except Exception as e:
-                QMessageBox.critical(self, "备份失败", f"无法创建备份文件：{str(e)}")
-    
-    def restore_database(self):
-        """恢复数据库"""
-        from models.database import DB_PATH, get_db
-        from sqlalchemy import create_engine
-
-        # 关闭现有数据库连接
-        try:
-            db = next(get_db())
-            db.close()
-        except:
-            pass
-
-        # 选择备份文件
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "选择备份文件", "", "Database Files (*.db);;All Files (*)"
-        )
-
-        if file_path:
-            try:
-                # 备份当前数据库（以防万一）
-                backup_path = f"{DB_PATH}.bak"
-                shutil.copy2(DB_PATH, backup_path)
-                
-                # 恢复选中的备份
-                shutil.copy2(file_path, DB_PATH)
-                QMessageBox.information(self, "成功", "数据库恢复成功！程序将重启以应用更改。")
-                # 重启应用
-                os.execl(sys.executable, sys.executable, *sys.argv)
-            except Exception as e:
-                QMessageBox.critical(self, "恢复失败", f"无法恢复数据库：{str(e)}")
-    
-    def set_reminder(self, invoice_id):
-        """设置报销提醒"""
-        from models.database import get_db, Invoice
-
-        db = next(get_db())
-        invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
-        if invoice:
-            date_dialog = QDateEdit(QDate.currentDate().addDays(7))
-            date_dialog.setDisplayFormat("yyyy-MM-dd")
-            date_dialog.setCalendarPopup(True)
-
-            if QMessageBox.question(self, "设置提醒", "选择报销截止日期:",
-                                   QMessageBox.Ok | QMessageBox.Cancel) == QMessageBox.Ok:
-                invoice.due_date = date_dialog.date().toPyDate()
-                db.commit()
-                self.load_invoices()
-    
-    def delete_invoice(self, invoice_id):
-        """删除发票记录、对应的文件以及关联的行程记录"""
-        from models.database import get_db, Invoice, Itinerary
-        import os
-
-        # 显示确认对话框
-        reply = QMessageBox.question(self, '确认删除', '确定要删除此发票吗？',
-                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-
-        if reply == QMessageBox.Yes:
-            db = next(get_db())
-            invoice = db.query(Invoice).filter(Invoice.id == invoice_id).first()
-            if invoice:
-                try:
-                    # 先删除关联的行程记录
-                    itineraries = db.query(Itinerary).filter(Itinerary.invoice_id == invoice_id).all()
-                    for itinerary in itineraries:
-                        db.delete(itinerary)
-                    
-                    # 删除对应的PDF文件
-                    if invoice.pdf_path and os.path.exists(invoice.pdf_path):
-                        os.remove(invoice.pdf_path)
-
-                    # 从数据库中删除发票记录
-                    db.delete(invoice)
-                    db.commit()
-                    QMessageBox.information(self, "成功", "发票及其关联的行程已成功删除！")
-                    self.load_invoices()
-                except Exception as e:
-                    db.rollback()
-                    QMessageBox.critical(self, "错误", f"删除发票失败: {str(e)}")
-    
-    def generate_report(self):
-        """生成市内交通明细表，并将选中的发票标记为已报销"""
-        from services.excel_generator import ExcelGenerator
-        from models.database import get_db, Invoice
-        from datetime import datetime
-        import os
-        import shutil
-
-        # 获取选中的发票ID
-        selected_rows = set(index.row() for index in self.invoice_table.selectedIndexes())
-        if not selected_rows:
-            QMessageBox.information(self, "提示", "请先选择要包含在报表中的发票")
-            return
-
-        # 获取选中发票的ID
-        db = next(get_db())
-        invoices = db.query(Invoice).all()
-        selected_invoice_ids = []
-        selected_invoices = []
-        for row in selected_rows:
-            invoice_number = self.invoice_table.item(row, 0).text()
-            for invoice in invoices:
-                if invoice.invoice_number == invoice_number:
-                    selected_invoice_ids.append(invoice.id)
-                    selected_invoices.append(invoice)
-                    break
-
-        # 生成报表
-        try:
-            # 创建已报销子文件夹（按当前日期）
-            base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'invoices', '已报销')
-            current_date = datetime.now().strftime('%Y-%m')
-            reimbursement_folder = os.path.join(base_dir, current_date)
-            os.makedirs(reimbursement_folder, exist_ok=True)
-
-            excel_generator = ExcelGenerator()
-            # 将报表保存到已报销文件夹
-            report_path = excel_generator.generate_transportation_table(selected_invoice_ids, reimbursement_folder)
-
-            # 将选中的发票标记为已报销并移动文件
-            for invoice in selected_invoices:
-                if not invoice.is_reimbursed:
-                    invoice.is_reimbursed = True
-                    invoice.reimbursement_date = datetime.now().date()
-
-                    # 移动发票文件到已报销子文件夹
-                    if invoice.pdf_path and os.path.exists(invoice.pdf_path):
-                        # 解析发票信息以生成新路径
-                        from services.ocr_processor import OCRProcessor
-                        ocr = OCRProcessor()
-                        text = ocr.extract_text_from_pdf(invoice.pdf_path)
-                        parsed_info = ocr.parse_invoice_info(text)
-
-                        # 生成新路径
-                        new_file_path = self._rename_invoice_file(
-                            invoice.pdf_path, parsed_info, True, invoice.category, reimbursement_folder
-                        )
-
-                        # 尝试移动对应的行程单文件
-                        invoice_dir = os.path.dirname(invoice.pdf_path)
-                        invoice_filename = os.path.basename(invoice.pdf_path)
-                        invoice_name_without_ext = os.path.splitext(invoice_filename)[0]
-                        itinerary_filename = f"{invoice_name_without_ext}_行程单.pdf"
-                        itinerary_path = os.path.join(invoice_dir, itinerary_filename)
-
-                        if os.path.exists(itinerary_path):
-                            # 生成行程单新路径
-                            new_itinerary_name = f"{os.path.splitext(os.path.basename(new_file_path))[0]}_行程单.pdf"
-                            new_itinerary_path = os.path.join(reimbursement_folder, new_itinerary_name)
-                            # 移动行程单文件
-                            shutil.move(itinerary_path, new_itinerary_path)
-                            print(f"已移动行程单文件: {itinerary_path} -> {new_itinerary_path}")
-                        else:
-                            # 可能有时间戳的行程单文件
-                            for file in os.listdir(invoice_dir):
-                                if f"{invoice_name_without_ext}_行程单" in file:
-                                    itinerary_path = os.path.join(invoice_dir, file)
-                                    new_itinerary_name = f"{os.path.splitext(os.path.basename(new_file_path))[0]}_{os.path.splitext(file)[1]}"
-                                    new_itinerary_path = os.path.join(reimbursement_folder, new_itinerary_name)
-                                    shutil.move(itinerary_path, new_itinerary_path)
-                                    print(f"已移动行程单文件: {itinerary_path} -> {new_itinerary_path}")
-                                    break
-
-                        # 更新数据库中的文件路径
-                        invoice.pdf_path = new_file_path
-
-            db.commit()
-            self.load_invoices()
-
-            QMessageBox.information(self, "成功", f"报表生成成功！\n文件路径：{report_path}\n已将选中的发票标记为已报销并移动到对应文件夹。")
-            # 打开生成的报表
-            os.startfile(report_path)
-        except Exception as e:
-            db.rollback()
-            QMessageBox.critical(self, "错误", f"生成报表失败: {str(e)}")
-    
-    def bulk_delete_invoices(self):
-        """批量删除选中的发票及其关联的行程记录"""
-        # 获取选中的行
-        selected_rows = set(index.row() for index in self.invoice_table.selectedIndexes())
-        if not selected_rows:
-            QMessageBox.warning(self, "警告", "请先选择要删除的发票！")
-            return
-
-        # 确认删除
-        reply = QMessageBox.question(self, '确认删除', f'确定要删除选中的 {len(selected_rows)} 个发票吗？',
-                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-
-        if reply == QMessageBox.Yes:
-            from models.database import get_db, Invoice, Itinerary
-            import os
-
-            db = next(get_db())
-            invoices = db.query(Invoice).all()
-            deleted_count = 0
-            failed_count = 0
-            failed_invoices = []
-
-            try:
-                for row in selected_rows:
-                    invoice_number = self.invoice_table.item(row, 0).text()
-                    # 查找对应的发票
-                    for invoice in invoices:
-                        if invoice.invoice_number == invoice_number:
-                            try:
-                                # 删除关联的行程记录
-                                itineraries = db.query(Itinerary).filter(Itinerary.invoice_id == invoice.id).all()
-                                for itinerary in itineraries:
-                                    db.delete(itinerary)
-
-                                # 删除对应的PDF文件
-                                if invoice.pdf_path and os.path.exists(invoice.pdf_path):
-                                    os.remove(invoice.pdf_path)
-
-                                # 从数据库中删除发票记录
-                                db.delete(invoice)
-                                deleted_count += 1
-                            except Exception as e:
-                                failed_count += 1
-                                failed_invoices.append(f"{invoice_number}: {str(e)}")
-                            break
-
-                db.commit()
-                message = f"成功删除 {deleted_count} 个发票及其关联的行程记录！"
-                if failed_count > 0:
-                    message += f"\n\n有 {failed_count} 个发票删除失败:\n" + "\n".join(failed_invoices)
-                QMessageBox.information(self, "成功", message)
-                self.load_invoices()
-            except Exception as e:
-                db.rollback()
-                QMessageBox.critical(self, "错误", f"批量删除失败: {str(e)}")
-    
     def manual_add_invoice(self):
         """手动添加发票信息"""
         from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QDateEdit, QPushButton, QFileDialog, QComboBox, QDoubleSpinBox
